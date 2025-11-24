@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
+
 import sys
 import re
+import json
 from collections import defaultdict
+from pathlib import Path
 
 import spotipy
 from spotipy.oauth2 import SpotifyOAuth
@@ -16,6 +19,31 @@ SCOPE = (
     "playlist-modify-public "
     "playlist-modify-private"
 )
+
+# Simple JSON file to remember which tracks you chose to keep
+CACHE_PATH = Path("playlist_refiner_cache.json")
+
+
+def load_decision_cache():
+    if CACHE_PATH.is_file():
+        try:
+            with CACHE_PATH.open("r", encoding="utf-8") as f:
+                data = json.load(f)
+            if not isinstance(data, dict):
+                return {"keep": []}
+            data.setdefault("keep", [])
+            return data
+        except Exception:
+            return {"keep": []}
+    return {"keep": []}
+
+
+def save_decision_cache(cache):
+    try:
+        with CACHE_PATH.open("w", encoding="utf-8") as f:
+            json.dump(cache, f, indent=2)
+    except Exception as e:
+        print(f"Warning: could not save cache file: {e}")
 
 
 def extract_playlist_id(s: str) -> str:
@@ -58,7 +86,6 @@ def choose_playlist_interactively(sp):
     my_id = me["id"]
     playlists = get_all_playlists(sp)
 
-    # "Managed" = owned by you. (Could extend to collaborative if you want.)
     owned = [pl for pl in playlists if pl["owner"]["id"] == my_id]
 
     if not owned:
@@ -74,8 +101,7 @@ def choose_playlist_interactively(sp):
 
     while True:
         choice = input(
-            "\nEnter the playlist number to edit "
-            "or 'q' to quit: "
+            "\nEnter the playlist number to edit or 'q' to quit: "
         ).strip().lower()
         if choice == "q":
             return None
@@ -89,8 +115,6 @@ def choose_playlist_interactively(sp):
         return owned[num - 1]["id"]
 
 
-# ---------- Helpers for duplicate detection ----------
-
 def normalize_title(name: str) -> str:
     """
     Normalize track title for duplicate grouping:
@@ -100,28 +124,23 @@ def normalize_title(name: str) -> str:
     - clean extra spaces
     """
     name = name.lower()
-    # normalize fancy dashes
     name = name.replace("–", "-").replace("—", "-")
-    # collapse spaces
     name = re.sub(r"\s+", " ", name).strip()
 
-    # keywords that usually indicate "same song, different version"
-    qualifier_words = r"remaster(ed)?|reissue|version|edit|mix|remix|mono|stereo|single|radio edit|album version"
+    qualifier_words = (
+        r"remaster(ed)?|reissue|version|edit|mix|remix|mono|stereo|single|"
+        r"radio edit|album version"
+    )
 
-    # 1) remove (...) with these qualifiers: e.g. "(Remastered)", "(2025 Reissue)"
+    # (Remastered), (2025 Reissue), etc.
     name = re.sub(rf"\s*\(([^)]*({qualifier_words})[^)]*)\)", "", name)
-
-    # 2) remove [...] with these qualifiers, just in case: e.g. "[2025 Version]"
+    # [Remastered], [2025 Version], etc.
     name = re.sub(rf"\s*\[([^\]]*({qualifier_words})[^\]]*)\]", "", name)
-
-    # 3) remove suffixes like:
-    #    " - Remastered", " - 2011 Remaster", " - 2025 version"
+    # " - Remastered", " - 2011 Remaster", " - 2025 version"
     name = re.sub(rf"\s*-\s*(\d{{4}}\s*)?({qualifier_words})\b.*$", "", name)
-
-    # 4) optionally: strip a bare year suffix like " - 2025"
+    # bare " - 2025"
     name = re.sub(r"\s*-\s*\d{4}\b$", "", name)
 
-    # final cleanup
     name = re.sub(r"\s+", " ", name).strip(" -")
     return name
 
@@ -130,8 +149,6 @@ def normalize_artist(name: str) -> str:
     """Normalize main artist name for duplicate grouping."""
     return name.lower().strip()
 
-
-# ---------- Duplicate handling ----------
 
 def commit_duplicate_removals(sp, playlist_id, dup_removals):
     if not dup_removals:
@@ -162,16 +179,16 @@ def commit_duplicate_removals(sp, playlist_id, dup_removals):
     print("Duplicate occurrences removed.\n")
 
 
-def handle_duplicates(sp, playlist_id, tracks):
+def handle_duplicates(sp, playlist_id, tracks, keep_set):
     """
     Group tracks by (normalized title + main artist) and let the user
     remove extra copies (exact duplicates or different album versions).
 
-    NEW BEHAVIOR:
-    - Enter numbers like '2' or '1,3' -> KEEP ONLY those entries, remove the others.
-    - Enter '-2,3' -> REMOVE those entries, keep the others.
-    - Enter nothing -> keep all.
-    - Enter 'q' -> stop duplicate review and apply removals so far.
+    BEHAVIOR:
+    - Enter numbers to KEEP (e.g. '2' or '1,3') -> remove all others in that group.
+    - Enter '-2,3' to REMOVE those entries and keep the others.
+    - Press Enter to keep all.
+    - Type 'q' to stop duplicate review and apply removals so far.
     """
     groups = defaultdict(list)
 
@@ -181,6 +198,7 @@ def handle_duplicates(sp, playlist_id, tracks):
             continue
 
         title = track["name"]
+        track_id = track["id"]
         artists_list = [a["name"] for a in track["artists"]]
         main_artist = artists_list[0] if artists_list else "Unknown"
         key = (normalize_title(title), normalize_artist(main_artist))
@@ -211,6 +229,7 @@ def handle_duplicates(sp, playlist_id, tracks):
                 "uri": track["uri"],
                 "duration_ms": dur_ms,
                 "duration_str": duration_str,
+                "track_id": track_id,
             }
         )
 
@@ -255,6 +274,10 @@ def handle_duplicates(sp, playlist_id, tracks):
 
             if not resp:
                 # keep all entries in this group
+                # mark all as kept in cache
+                for e in entries:
+                    if e["track_id"]:
+                        keep_set.add(e["track_id"])
                 break
 
             # detect remove mode if response starts with '-'
@@ -267,6 +290,10 @@ def handle_duplicates(sp, playlist_id, tracks):
             try:
                 nums = [int(x) for x in s.replace(" ", "").split(",") if x]
                 if not nums:
+                    # treat as keep all
+                    for e in entries:
+                        if e["track_id"]:
+                            keep_set.add(e["track_id"])
                     break
                 if not all(1 <= n <= len(entries) for n in nums):
                     raise ValueError
@@ -277,16 +304,22 @@ def handle_duplicates(sp, playlist_id, tracks):
             selected = set(nums)
 
             if remove_mode:
-                # REMOVE only the selected entries
-                for n in selected:
-                    e = entries[n - 1]
-                    dup_removals.append(
-                        {"uri": e["uri"], "position": e["playlist_index"]}
-                    )
+                # REMOVE only the selected entries, keep others
+                for idx_e, e in enumerate(entries, start=1):
+                    if idx_e in selected:
+                        dup_removals.append(
+                            {"uri": e["uri"], "position": e["playlist_index"]}
+                        )
+                    else:
+                        if e["track_id"]:
+                            keep_set.add(e["track_id"])
             else:
                 # KEEP only the selected entries -> remove all others
                 for idx_e, e in enumerate(entries, start=1):
-                    if idx_e not in selected:
+                    if idx_e in selected:
+                        if e["track_id"]:
+                            keep_set.add(e["track_id"])
+                    else:
                         dup_removals.append(
                             {"uri": e["uri"], "position": e["playlist_index"]}
                         )
@@ -296,9 +329,7 @@ def handle_duplicates(sp, playlist_id, tracks):
     commit_duplicate_removals(sp, playlist_id, dup_removals)
 
 
-# ---------- Year-based filtering ----------
-
-def review_tracks_by_year(sp, playlist_id, tracks, cutoff_year):
+def review_tracks_by_year(sp, playlist_id, tracks, cutoff_year, keep_set):
     print(
         f"\n=== Year-based cleanup (albums after {cutoff_year}) ===\n"
         f"Only tracks whose album year is > {cutoff_year} (or unknown) will be shown.\n"
@@ -309,6 +340,11 @@ def review_tracks_by_year(sp, playlist_id, tracks, cutoff_year):
     for idx, item in enumerate(tracks, start=1):
         track = item["track"]
         if track is None:
+            continue
+
+        track_id = track["id"]
+        # Skip tracks we already decided to keep in a previous run
+        if track_id in keep_set:
             continue
 
         track_name = track["name"]
@@ -354,7 +390,9 @@ def review_tracks_by_year(sp, playlist_id, tracks, cutoff_year):
         elif choice == "y":
             to_remove_uris.append(track["uri"])
         else:
-            # default / 'n' / ''  -> keep track
+            # default / 'n' / ''  -> keep track and remember that decision
+            if track_id:
+                keep_set.add(track_id)
             continue
 
     # Deduplicate URIs (just in case)
@@ -401,10 +439,8 @@ def ask_cutoff_year():
         return year
 
 
-# ---------- Main ----------
-
 def main():
-    # Uses env vars by default; or hard-code client_id etc in SpotifyOAuth(...)
+    # Uses environment variables by default; or you can pass client_id etc
     sp = spotipy.Spotify(auth_manager=SpotifyOAuth(scope=SCOPE))
 
     me = sp.current_user()
@@ -427,6 +463,10 @@ def main():
         f"(owner: {playlist['owner']['display_name']})"
     )
 
+    # Load cache of previous "keep" decisions
+    decision_cache = load_decision_cache()
+    keep_set = set(decision_cache.get("keep", []))
+
     cutoff_year = ask_cutoff_year()
     print(f"Using cutoff year: {cutoff_year}\n")
 
@@ -434,11 +474,15 @@ def main():
     print(f"Found {len(tracks)} tracks.\n")
 
     # Step 1: handle duplicates (same song, exact or remastered/original)
-    handle_duplicates(sp, playlist_id, tracks)
+    handle_duplicates(sp, playlist_id, tracks, keep_set)
 
     # Step 2: re-fetch playlist and do year-based cleanup
     tracks = get_all_tracks(sp, playlist_id)
-    review_tracks_by_year(sp, playlist_id, tracks, cutoff_year)
+    review_tracks_by_year(sp, playlist_id, tracks, cutoff_year, keep_set)
+
+    # Save updated keep_set back to cache
+    decision_cache["keep"] = sorted(keep_set)
+    save_decision_cache(decision_cache)
 
 
 if __name__ == "__main__":
